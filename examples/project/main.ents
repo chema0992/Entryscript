@@ -1,0 +1,5 @@
+@엔트리봇 {
+    when start {
+        say("Hello from settings.json!")
+    }
+}

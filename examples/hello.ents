@@ -1,0 +1,16 @@
+@오브젝트 {
+    when start {
+        say("안녕!")
+
+        for 10 {
+            move(10)
+            wait(0.5)
+        }
+
+        if (1 < 2) {
+            say("참!")
+        } else {
+            say("거짓!")
+        }
+    }
+}

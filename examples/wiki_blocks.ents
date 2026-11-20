@@ -1,0 +1,30 @@
+var score = 0
+list words = ["banana", "entry"]
+
+fn show_if_number(value) {
+    if is_type(value, "number") {
+        say("number")
+    } else {
+        say("not a number")
+    }
+}
+
+@엔트리봇 {
+    when start {
+        go_to_mouse()
+        point_towards_mouse()
+        rotate_by_time(1, 45)
+        direction_relative_duration(1, 45)
+        set_brush_transparency(25)
+        clear_brush()
+        stop_this_thread()
+        timer_start()
+        show_project_timer()
+        show_answer()
+        say(object_rotation())
+        say(object_size())
+        say(count_match_string("banana", "a"))
+        say(list_get(words, 1))
+        show_if_number("123")
+    }
+}

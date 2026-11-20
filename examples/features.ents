@@ -1,0 +1,34 @@
+// Global variables and lists are added to the Entry project automatically.
+var score = 0
+var player_name = "Ada"
+list inventory = ["coin", "key"]
+
+// A normal function. Parameters are value parameters by default.
+fn announce(message, condition: bool) {
+    if condition {
+        say(message)
+    }
+}
+
+// A value function returns the expression after ->.
+fn add(a, b) -> a + b {
+}
+
+@엔트리봇 {
+    when start {
+        announce("Entscript is running!", true)
+
+        set(score, add(10, 20))
+        list_add(inventory, "gem")
+        list_insert(inventory, 2, "map")
+        list_set(inventory, 1, "ticket")
+        list_remove(inventory, 3)
+
+        if list_contains(inventory, "gem") {
+            say(list_get(inventory, 1))
+        }
+
+        say(list_length(inventory))
+        list_show(inventory)
+    }
+}

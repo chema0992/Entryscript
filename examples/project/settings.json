@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "metadata": {
+    "name": "Entscript Example",
+    "description": "Example project built with Entscript",
+    "category": "game",
+    "tags": ["Entscript", "Example"]
+  },
+  "build": {
+    "entry": "main.ents",
+    "output": "build/example.ent"
+  }
+}
