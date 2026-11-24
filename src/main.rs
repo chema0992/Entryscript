@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
@@ -27,7 +28,7 @@ Build command (reads ./settings.json):
 Legacy direct compile:
   <SOURCE>                 Entscript source file, or - to read from stdin
   -o, --output <FILE>      Output Entry package path (default: source name with .ent)
-                           Use - for a tar archive on stdout
+                           Use - for a gzip-compressed tar archive on stdout
   -p, --project <FILE>     Existing Entry project JSON to update
 
 Common options:
@@ -35,7 +36,7 @@ Common options:
   -V, --version            Print version information
 
 Package format:
-  <FILE>.ent is a tar archive containing temp/project.json
+  <FILE>.ent is a gzip-compressed tar archive containing temp/project.json and assets
 
 Examples:
   entscript build
@@ -296,10 +297,11 @@ fn build_project(args: BuildArgs) -> Result<(), Box<dyn Error>> {
         })
         .unwrap_or_else(|| default_output_path(&source_path));
 
+    let assets_dir = project_dir.join("assets");
     if output_path == PathBuf::from("-") {
-        write_archive_to_stdout(&output_json)?;
+        write_archive_to_stdout(&output_json, Some(&assets_dir))?;
     } else {
-        write_archive_file(&output_path, &output_json)?;
+        write_archive_file(&output_path, &output_json, Some(&assets_dir))?;
         eprintln!("Created {}", output_path.display());
     }
 
@@ -340,10 +342,11 @@ fn compile_file(args: CliArgs) -> Result<(), Box<dyn Error>> {
         }
     });
 
+    let assets_dir = env::current_dir()?.join("assets");
     if output_path == PathBuf::from("-") {
-        write_archive_to_stdout(&output_json)?;
+        write_archive_to_stdout(&output_json, Some(&assets_dir))?;
     } else {
-        write_archive_file(&output_path, &output_json)?;
+        write_archive_file(&output_path, &output_json, Some(&assets_dir))?;
         eprintln!("Created {}", output_path.display());
     }
 
@@ -542,7 +545,11 @@ fn default_output_path(source: &Path) -> PathBuf {
 
 /// Creates a package whose archive root is `temp/` and whose project file is
 /// exactly `temp/project.json`.
-fn write_archive_file(output_path: &Path, project_json: &str) -> io::Result<()> {
+fn write_archive_file(
+    output_path: &Path,
+    project_json: &str,
+    assets_dir: Option<&Path>,
+) -> io::Result<()> {
     let output_path = make_absolute(output_path)?;
     let output_parent = output_path
         .parent()
@@ -551,7 +558,7 @@ fn write_archive_file(output_path: &Path, project_json: &str) -> io::Result<()> 
     fs::create_dir_all(output_parent)?;
 
     let stage = TempDirectory::create()?;
-    write_staged_project(stage.path(), project_json)?;
+    write_staged_project(stage.path(), project_json, assets_dir)?;
 
     // Match the requested workflow: create <target>.tar, then rename it to
     // <target>.ent. The tar file is placed beside the destination so rename
@@ -574,12 +581,12 @@ fn write_archive_file(output_path: &Path, project_json: &str) -> io::Result<()> 
     Ok(())
 }
 
-fn write_archive_to_stdout(project_json: &str) -> io::Result<()> {
+fn write_archive_to_stdout(project_json: &str, assets_dir: Option<&Path>) -> io::Result<()> {
     let stage = TempDirectory::create()?;
-    write_staged_project(stage.path(), project_json)?;
+    write_staged_project(stage.path(), project_json, assets_dir)?;
 
     let status = Command::new("tar")
-        .args([OsStr::new("-cvf"), OsStr::new("-"), OsStr::new("temp")])
+        .args([OsStr::new("-czf"), OsStr::new("-"), OsStr::new("temp")])
         .current_dir(stage.path())
         .status()
         .map_err(|error| {
@@ -599,15 +606,186 @@ fn write_archive_to_stdout(project_json: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn write_staged_project(stage_root: &Path, project_json: &str) -> io::Result<()> {
+fn write_staged_project(
+    stage_root: &Path,
+    project_json: &str,
+    assets_dir: Option<&Path>,
+) -> io::Result<()> {
     let package_dir = stage_root.join("temp");
     fs::create_dir(&package_dir)?;
-    fs::write(package_dir.join("project.json"), project_json.as_bytes())
+    fs::write(package_dir.join("project.json"), project_json.as_bytes())?;
+
+    if let Some(assets_dir) = assets_dir {
+        copy_entry_assets(assets_dir, &package_dir, project_json)?;
+    }
+
+    Ok(())
+}
+
+/// Copy only the local Entry assets referenced by project JSON into `temp/`.
+/// Unused files and unrelated files in `assets/` are deliberately omitted.
+/// References are constrained to Entry's hashed asset directory layout.
+fn copy_entry_assets(
+    source_root: &Path,
+    package_root: &Path,
+    project_json: &str,
+) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(source_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            validate_referenced_entry_assets(source_root, project_json)?;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("assets path '{}' must be a real directory, not a file or symlink", source_root.display()),
+        ));
+    }
+
+    let references = entry_asset_references(project_json)?;
+    for relative_path in references {
+        let source_path = validate_entry_asset_file(source_root, &relative_path)?;
+        let destination = package_root.join(&relative_path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source_path, destination)?;
+    }
+
+    Ok(())
+}
+
+/// Verify that local Entry-managed images, thumbnails, and sounds referenced
+/// by project JSON exist before creating the package. Built-in runtime URLs and
+/// other paths outside Entry's hashed asset layout are left untouched.
+fn validate_referenced_entry_assets(source_root: &Path, project_json: &str) -> io::Result<()> {
+    for relative_path in entry_asset_references(project_json)? {
+        validate_entry_asset_file(source_root, &relative_path)?;
+    }
+    Ok(())
+}
+
+fn entry_asset_references(project_json: &str) -> io::Result<BTreeSet<PathBuf>> {
+    let project: Value = serde_json::from_str(project_json).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("generated project JSON is invalid while checking assets: {error}"),
+        )
+    })?;
+    let mut references = BTreeSet::new();
+    collect_entry_asset_references(&project, &mut references);
+    Ok(references)
+}
+
+fn validate_entry_asset_file(source_root: &Path, relative_path: &Path) -> io::Result<PathBuf> {
+    let mut source_path = source_root.to_path_buf();
+    let mut metadata = None;
+    for component in relative_path.components() {
+        source_path.push(component);
+        let current_metadata = fs::symlink_metadata(&source_path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "project references asset '{}', but it is missing from '{}'",
+                    relative_path.display(),
+                    source_root.display()
+                ),
+            )
+        })?;
+        if current_metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "project asset '{}' contains a symbolic link",
+                    relative_path.display()
+                ),
+            ));
+        }
+        metadata = Some(current_metadata);
+    }
+
+    let metadata = metadata.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "empty Entry asset path")
+    })?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "project asset '{}' must be a regular file inside '{}'",
+                relative_path.display(),
+                source_root.display()
+            ),
+        ));
+    }
+
+    Ok(source_path)
+}
+
+fn collect_entry_asset_references(value: &Value, references: &mut BTreeSet<PathBuf>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_entry_asset_references(item, references);
+            }
+        }
+        Value::Object(fields) => {
+            for (key, item) in fields {
+                if matches!(key.as_str(), "fileurl" | "thumbUrl") {
+                    if let Some(reference) = item.as_str() {
+                        if let Some(path) = entry_asset_relative_path(reference) {
+                            references.insert(path);
+                        }
+                    }
+                }
+                collect_entry_asset_references(item, references);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract the four safe path components from an Entry asset URL/path:
+/// `<2>/<2>/{image|thumb|sound}/<file-id>.<ext>`.
+fn entry_asset_relative_path(reference: &str) -> Option<PathBuf> {
+    let without_query = reference.split(|character| character == '?' || character == '#')
+        .next().unwrap_or(reference);
+    let normalized = without_query.replace('\\', "/");
+    let parts = normalized.split('/').filter(|part| !part.is_empty()).collect::<Vec<_>>();
+
+    for window in parts.windows(4) {
+        let first = window[0];
+        let second = window[1];
+        let kind = window[2];
+        let filename = window[3];
+        if first.len() != 2 || second.len() != 2
+            || !first.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !second.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !matches!(kind, "image" | "thumb" | "sound")
+        {
+            continue;
+        }
+        let Some((file_id, extension)) = filename.rsplit_once('.') else { continue };
+        if extension.is_empty()
+            || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || file_id.len() < 4
+            || !file_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || !file_id[..2].eq_ignore_ascii_case(first)
+            || !file_id[2..4].eq_ignore_ascii_case(second)
+        {
+            continue;
+        }
+        return Some(PathBuf::from(first).join(second).join(kind).join(filename));
+    }
+
+    None
 }
 
 fn run_tar(stage_root: &Path, tar_path: &Path) -> io::Result<()> {
     let status = Command::new("tar")
-        .arg("-cvf")
+        .arg("-czf")
         .arg(tar_path)
         .arg("temp")
         .current_dir(stage_root)
@@ -711,6 +889,7 @@ mod tests {
     };
     use serde_json::Value;
     use std::ffi::OsString;
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -856,10 +1035,10 @@ mod tests {
         let archive_path = output_dir.path().join("sample.ent");
         let expected_json = r#"{"objects":[]}"#;
 
-        write_archive_file(&archive_path, expected_json).unwrap();
+        write_archive_file(&archive_path, expected_json, None).unwrap();
 
         let listing = Command::new("tar")
-            .arg("-tf")
+            .arg("-tzf")
             .arg(&archive_path)
             .output()
             .unwrap();
@@ -872,7 +1051,7 @@ mod tests {
         let extract_dir = output_dir.path().join("extract");
         std::fs::create_dir(&extract_dir).unwrap();
         let extract_status = Command::new("tar")
-            .arg("-xf")
+            .arg("-xzf")
             .arg(&archive_path)
             .arg("-C")
             .arg(&extract_dir)
@@ -882,6 +1061,103 @@ mod tests {
 
         let actual_json = std::fs::read_to_string(extract_dir.join("temp/project.json")).unwrap();
         assert_eq!(actual_json, expected_json);
+    }
+
+    #[test]
+    fn packages_entry_assets_in_the_expected_directory_layout() {
+        let output_dir = TempDirectory::create().unwrap();
+        let project_dir = output_dir.path().join("project");
+        let assets_dir = project_dir.join("assets");
+        let asset_relative = Path::new("ab/cd/image/abcd1234.png");
+        let asset_source = assets_dir.join(asset_relative);
+        std::fs::create_dir_all(asset_source.parent().unwrap()).unwrap();
+        std::fs::write(&asset_source, b"test-image").unwrap();
+
+        let unused_asset = assets_dir.join("ef/gh/sound/efgh5678.mp3");
+        std::fs::create_dir_all(unused_asset.parent().unwrap()).unwrap();
+        std::fs::write(&unused_asset, b"unused-sound").unwrap();
+        std::fs::write(assets_dir.join("thumbnail.png"), b"not-an-entry-asset").unwrap();
+
+        let project_json = r#"{
+            "objects": [{
+                "sprite": {
+                    "pictures": [{
+                        "fileurl": "https://cdn.example/ab/cd/image/abcd1234.png"
+                    }]
+                }
+            }]
+        }"#;
+        let archive_path = output_dir.path().join("assets.ent");
+        write_archive_file(&archive_path, project_json, Some(&assets_dir)).unwrap();
+
+        let extract_dir = output_dir.path().join("extract-assets");
+        std::fs::create_dir(&extract_dir).unwrap();
+        let status = Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive_path)
+            .arg("-C")
+            .arg(&extract_dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read(extract_dir.join("temp").join(asset_relative)).unwrap(),
+            b"test-image"
+        );
+        assert!(!extract_dir.join("temp/thumbnail.png").exists());
+        assert!(!extract_dir.join("temp/ef/gh/sound/efgh5678.mp3").exists());
+    }
+
+    #[test]
+    fn verifies_image_thumbnail_and_sound_assets_referenced_by_project_json() {
+        let output_dir = TempDirectory::create().unwrap();
+        let assets_dir = output_dir.path().join("assets");
+        let image = Path::new("ab/cd/image/abcd1234.png");
+        let thumbnail = Path::new("ef/gh/thumb/efgh5678.png");
+        let sound = Path::new("wx/yz/sound/wxyz9012.mp3");
+
+        for path in [image, thumbnail, sound] {
+            let file = assets_dir.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, b"asset").unwrap();
+        }
+
+        let project_json = r#"{
+            "objects": [{
+                "sprite": {
+                    "pictures": [{
+                        "fileurl": "https://cdn.example/ab/cd/image/abcd1234.png",
+                        "thumbUrl": "/ef/gh/thumb/efgh5678.png?cache=1"
+                    }],
+                    "sounds": [{
+                        "fileurl": "./wx/yz/sound/wxyz9012.mp3"
+                    }]
+                }
+            }]
+        }"#;
+
+        validate_referenced_entry_assets(&assets_dir, project_json).unwrap();
+    }
+
+    #[test]
+    fn fails_when_a_referenced_entry_asset_is_missing() {
+        let output_dir = TempDirectory::create().unwrap();
+        let assets_dir = output_dir.path().join("assets");
+        fs::create_dir_all(&assets_dir).unwrap();
+
+        let project_json = r#"{
+            "objects": [{
+                "sprite": {
+                    "pictures": [{
+                        "fileurl": "/ab/cd/image/abcd1234.png"
+                    }]
+                }
+            }]
+        }"#;
+
+        let error = validate_referenced_entry_assets(&assets_dir, project_json).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("abcd1234.png"));
     }
 
     #[test]

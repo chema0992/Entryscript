@@ -324,33 +324,38 @@ impl EntryBuilder {
 
     fn build_list_statement(name: &str, args: &[Expression], env: &BuildEnv<'_>) -> Result<EntryBlock, CompileError> {
         let block = match (name, args) {
-            ("list_add", [Expression::Identifier(list), value]) => {
+            ("list_add", [Expression::Identifier(list), value])
+            | ("list_add", [Expression::String(list), value]) => {
                 let id = Self::find_list_id(list, env)?;
                 EntryBlock::new_with_params("add_value_to_list", vec![
                     Self::build_expression(value, env)?, EntryInput::Field(id), EntryInput::Empty,
                 ])
             }
-            ("list_remove", [Expression::Identifier(list), index]) => {
+            ("list_remove", [Expression::Identifier(list), index])
+            | ("list_remove", [Expression::String(list), index]) => {
                 let id = Self::find_list_id(list, env)?;
                 EntryBlock::new_with_params("remove_value_from_list", vec![
                     Self::build_expression(index, env)?, EntryInput::Field(id), EntryInput::Empty,
                 ])
             }
-            ("list_insert", [Expression::Identifier(list), index, value]) => {
+            ("list_insert", [Expression::Identifier(list), index, value])
+            | ("list_insert", [Expression::String(list), index, value]) => {
                 let id = Self::find_list_id(list, env)?;
                 EntryBlock::new_with_params("insert_value_to_list", vec![
                     Self::build_expression(value, env)?, EntryInput::Field(id),
                     Self::build_expression(index, env)?, EntryInput::Empty,
                 ])
             }
-            ("list_set", [Expression::Identifier(list), index, value]) => {
+            ("list_set", [Expression::Identifier(list), index, value])
+            | ("list_set", [Expression::String(list), index, value]) => {
                 let id = Self::find_list_id(list, env)?;
                 EntryBlock::new_with_params("change_value_list_index", vec![
                     EntryInput::Field(id), Self::build_expression(index, env)?,
                     Self::build_expression(value, env)?, EntryInput::Empty,
                 ])
             }
-            ("list_show" | "list_hide", [Expression::Identifier(list)]) => {
+            ("list_show" | "list_hide", [Expression::Identifier(list)])
+            | ("list_show" | "list_hide", [Expression::String(list)]) => {
                 let id = Self::find_list_id(list, env)?;
                 EntryBlock::new_with_params(if name == "list_show" { "show_list" } else { "hide_list" }, vec![
                     EntryInput::Field(id), EntryInput::Empty,
@@ -523,20 +528,23 @@ impl EntryBuilder {
 
     fn build_list_reporter(name: &str, args: &[Expression], env: &BuildEnv<'_>) -> Result<EntryInput, CompileError> {
         let block = match (name, args) {
-            ("list_get", [Expression::Identifier(list), index]) => {
+            ("list_get", [Expression::Identifier(list), index])
+            | ("list_get", [Expression::String(list), index]) => {
                 let id = Self::find_list_id(list, env)?;
                 EntryBlock::new_with_params("value_of_index_from_list", vec![
                     EntryInput::Empty, EntryInput::Field(id), EntryInput::Empty,
                     Self::build_expression(index, env)?, EntryInput::Empty,
                 ])
             }
-            ("list_length", [Expression::Identifier(list)]) => {
+            ("list_length", [Expression::Identifier(list)])
+            | ("list_length", [Expression::String(list)]) => {
                 let id = Self::find_list_id(list, env)?;
                 EntryBlock::new_with_params("length_of_list", vec![
                     EntryInput::Empty, EntryInput::Field(id), EntryInput::Empty,
                 ])
             }
-            ("list_contains", [Expression::Identifier(list), value]) => {
+            ("list_contains", [Expression::Identifier(list), value])
+            | ("list_contains", [Expression::String(list), value]) => {
                 let id = Self::find_list_id(list, env)?;
                 EntryBlock::new_with_params("is_included_in_list", vec![
                     EntryInput::Empty, EntryInput::Field(id), EntryInput::Empty,
@@ -579,38 +587,66 @@ impl EntryBuilder {
     }
 
     fn find_variable_id(name: &str, env: &BuildEnv<'_>) -> Result<String, CompileError> {
-        let variables = env.project.get("variables").and_then(Value::as_array);
-        let owner_id = Self::current_object_id(env);
-        let find_id = |is_local: bool| {
-            variables.and_then(|items| items.iter().find(|variable| {
-                variable.get("name").and_then(Value::as_str) == Some(name)
-                    && if is_local {
-                        variable.get("object").and_then(Value::as_str) == owner_id && owner_id.is_some()
-                    } else {
-                        variable.get("object").map_or(true, Value::is_null)
-                    }
-            })).and_then(|variable| variable.get("id")).and_then(Value::as_str).map(str::to_owned)
-        };
-        find_id(true).or_else(|| find_id(false))
-            .ok_or_else(|| CompileError::Semantic(format!("Unknown variable '{name}'")))
+        Self::find_scoped_variable_id(name, env, false)
     }
 
     fn find_list_id(name: &str, env: &BuildEnv<'_>) -> Result<String, CompileError> {
-        let variables = env.project.get("variables").and_then(Value::as_array);
+        Self::find_scoped_variable_id(name, env, true)
+    }
+
+    fn find_scoped_variable_id(
+        name: &str,
+        env: &BuildEnv<'_>,
+        expect_list: bool,
+    ) -> Result<String, CompileError> {
+        let variables = env.project.get("variables")
+            .and_then(Value::as_array)
+            .ok_or_else(|| CompileError::Project("Project 'variables' must be an array".into()))?;
         let owner_id = Self::current_object_id(env);
-        let find_id = |is_local: bool| {
-            variables.and_then(|items| items.iter().find(|variable| {
-                variable.get("name").and_then(Value::as_str) == Some(name)
-                    && variable.get("variableType").and_then(Value::as_str) == Some("list")
-                    && if is_local {
-                        variable.get("object").and_then(Value::as_str) == owner_id && owner_id.is_some()
-                    } else {
-                        variable.get("object").map_or(true, Value::is_null)
-                    }
-            })).and_then(|variable| variable.get("id")).and_then(Value::as_str).map(str::to_owned)
-        };
-        find_id(true).or_else(|| find_id(false))
-            .ok_or_else(|| CompileError::Semantic(format!("Unknown list '{name}'")))
+        let mut local_matches = Vec::new();
+        let mut global_matches = Vec::new();
+
+        for variable in variables {
+            if variable.get("name").and_then(Value::as_str) != Some(name) {
+                continue;
+            }
+            let is_list = variable.get("variableType").and_then(Value::as_str) == Some("list");
+            if is_list != expect_list {
+                continue;
+            }
+
+            if let (Some(current_owner), Some(variable_owner)) = (
+                owner_id,
+                variable.get("object").and_then(Value::as_str),
+            ) {
+                if variable_owner == current_owner {
+                    local_matches.push(variable);
+                    continue;
+                }
+            }
+            if variable.get("object").map_or(true, Value::is_null) {
+                global_matches.push(variable);
+            }
+        }
+
+        let matches = if local_matches.is_empty() { &global_matches } else { &local_matches };
+        match matches.as_slice() {
+            [variable] => variable.get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| CompileError::Project(format!(
+                    "Project variable '{name}' is missing a valid string id"
+                ))),
+            [] => Err(CompileError::Semantic(if expect_list {
+                format!("Unknown list '{name}'")
+            } else {
+                format!("Unknown variable '{name}'")
+            })),
+            _ => Err(CompileError::Project(format!(
+                "Variable name '{name}' is ambiguous in the selected scope"
+            ))),
+        }
     }
 
     fn build_variable_reporter(name: &str, env: &BuildEnv<'_>) -> Result<EntryInput, CompileError> {

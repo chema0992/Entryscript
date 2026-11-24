@@ -1,5 +1,5 @@
-use entscript_converter::compile_to_json;
-use serde_json::Value;
+use entscript_converter::{compile_to_json, compile_with_project_value};
+use serde_json::{json, Value};
 
 fn compile(source: &str) -> Value {
     serde_json::from_str(&compile_to_json(source).expect("Entscript should compile"))
@@ -319,4 +319,169 @@ fn rejects_boolean_variable_as_a_boolean_parameter_input() {
         "#,
     ).unwrap_err();
     assert!(error.to_string().contains("must be a boolean"));
+}
+
+
+#[test]
+fn rejects_duplicate_existing_variables_in_the_same_scope() {
+    let mut project: Value = serde_json::from_str(
+        &compile_to_json("@엔트리봇 {} ").unwrap(),
+    ).unwrap();
+    project["variables"].as_array_mut().unwrap().extend([
+        json!({
+            "name": "score", "id": "one", "variableType": "variable",
+            "value": "0", "visible": false, "isCloud": false,
+            "object": null, "x": 0, "y": 0
+        }),
+        json!({
+            "name": "score", "id": "two", "variableType": "variable",
+            "value": "0", "visible": false, "isCloud": false,
+            "object": null, "x": 0, "y": 0
+        }),
+    ]);
+
+    let error = compile_with_project_value("@엔트리봇 {}", project).unwrap_err();
+    assert!(error.to_string().contains("duplicate variable name 'score'"));
+}
+
+#[test]
+fn rejects_existing_lists_with_malformed_items() {
+    let mut project: Value = serde_json::from_str(
+        &compile_to_json("@엔트리봇 {} ").unwrap(),
+    ).unwrap();
+    project["variables"].as_array_mut().unwrap().push(json!({
+        "name": "inventory",
+        "id": "list1",
+        "variableType": "list",
+        "array": [{ "value": "coin" }],
+        "visible": false,
+        "isCloud": false,
+        "object": null,
+        "x": 0,
+        "y": 0
+    }));
+
+    let error = compile_with_project_value("@엔트리봇 {}", project).unwrap_err();
+    assert!(error.to_string().contains("must contain a string 'data' field"));
+}
+
+#[test]
+fn resolves_object_local_variables_before_global_variables() {
+    let mut project: Value = serde_json::from_str(
+        &compile_to_json("@엔트리봇 {} ").unwrap(),
+    ).unwrap();
+    project["variables"].as_array_mut().unwrap().push(json!({
+        "name": "score",
+        "id": "glob",
+        "visible": false,
+        "value": "1",
+        "variableType": "variable",
+        "isCloud": false,
+        "object": null,
+        "x": 0,
+        "y": 0
+    }));
+    project["variables"].as_array_mut().unwrap().push(json!({
+        "name": "score",
+        "id": "loc1",
+        "visible": false,
+        "value": "10",
+        "variableType": "variable",
+        "isCloud": false,
+        "object": "7y0y",
+        "x": 0,
+        "y": 0
+    }));
+
+    let output = compile_with_project_value(
+        "@엔트리봇 { when start { say(score) } }",
+        project,
+    ).unwrap();
+    let output: Value = serde_json::from_str(&output).unwrap();
+    let script: Value = serde_json::from_str(output["objects"][0]["script"].as_str().unwrap()).unwrap();
+    assert_eq!(script[0][1]["params"][0]["params"][0], "loc1");
+}
+
+#[test]
+fn resolves_object_local_lists_before_same_named_global_variables() {
+    let mut project: Value = serde_json::from_str(
+        &compile_to_json("@엔트리봇 {} ").unwrap(),
+    ).unwrap();
+    project["variables"].as_array_mut().unwrap().push(json!({
+        "name": "items",
+        "id": "glob",
+        "visible": false,
+        "value": "",
+        "variableType": "variable",
+        "isCloud": false,
+        "object": null,
+        "x": 0,
+        "y": 0
+    }));
+    project["variables"].as_array_mut().unwrap().push(json!({
+        "name": "items",
+        "id": "locl",
+        "visible": false,
+        "value": "",
+        "variableType": "list",
+        "array": [],
+        "isCloud": false,
+        "object": "7y0y",
+        "x": 0,
+        "y": 0
+    }));
+
+    let output = compile_with_project_value(
+        "@엔트리봇 { when start { list_add(items, \"coin\") } }",
+        project,
+    ).unwrap();
+    let output: Value = serde_json::from_str(&output).unwrap();
+    let script: Value = serde_json::from_str(output["objects"][0]["script"].as_str().unwrap()).unwrap();
+    assert_eq!(script[0][1]["params"][1], "locl");
+}
+
+#[test]
+fn rejects_wrong_argument_count_for_imported_entry_functions() {
+    let project: Value = serde_json::from_str(
+        &compile_to_json("fn imported(value) { say(value) } @엔트리봇 {} ").unwrap(),
+    ).unwrap();
+    let function_id = project["functions"][0]["id"].as_str().unwrap();
+    let source = format!("@엔트리봇 {{ when start {{ func_{function_id}(1, 2) }} }}");
+    let error = compile_with_project_value(&source, project).unwrap_err();
+    assert!(error.to_string().contains("expects 1 argument(s), but 2 were provided"));
+}
+
+#[test]
+fn rejects_wrong_argument_kind_for_imported_entry_functions() {
+    let project: Value = serde_json::from_str(
+        &compile_to_json("fn imported(flag: bool) { } @엔트리봇 {} ").unwrap(),
+    ).unwrap();
+    let function_id = project["functions"][0]["id"].as_str().unwrap();
+    let source = format!("@엔트리봇 {{ when start {{ func_{function_id}(123) }} }}");
+    let error = compile_with_project_value(&source, project).unwrap_err();
+    assert!(error.to_string().contains("Argument 1 of Entry function"));
+    assert!(error.to_string().contains("must be a boolean"));
+}
+
+#[test]
+fn rejects_duplicate_function_names_from_existing_entry_project() {
+    let project: Value = serde_json::from_str(
+        &compile_to_json("fn greet() { say(\"hello\") } @엔트리봇 {} ").unwrap(),
+    ).unwrap();
+    let error = compile_with_project_value(
+        "fn greet() { say(\"again\") } @엔트리봇 {}",
+        project,
+    ).unwrap_err();
+    assert!(error.to_string().contains("Function 'greet' already exists"));
+}
+
+#[test]
+fn accepts_string_names_for_list_operations() {
+    let output = compile_to_json(
+        "list inventory = [] @엔트리봇 { when start { list_add(\"inventory\", \"coin\") say(list_get(\"inventory\", 1)) } }",
+    ).unwrap();
+    let project: Value = serde_json::from_str(&output).unwrap();
+    let blocks = object_blocks(&project);
+    assert_eq!(blocks[1]["type"], "add_value_to_list");
+    assert_eq!(blocks[2]["params"][0]["type"], "value_of_index_from_list");
 }

@@ -12,7 +12,7 @@ Entscript source (.ents)
  Entry project JSON
         |
         v
- tar package (.ent)
+ gzip TAR package (.ent)
 ```
 
 이 문서는 현재 저장소의 구현을 기준으로 작성한 공식 사용 설명서입니다.
@@ -23,6 +23,7 @@ Entscript source (.ents)
 - [설치 및 빌드](#설치-및-빌드)
 - [CLI 사용법](#cli-사용법)
 - [프로젝트 설정](#프로젝트-설정-settingsjson)
+- [에셋 디렉터리](#에셋-디렉터리)
 - [언어 문법](#언어-문법)
 - [변수와 리스트](#변수와-리스트)
 - [함수와 매개변수](#함수와-매개변수)
@@ -43,7 +44,7 @@ Entscript source (.ents)
 - `tar` 명령어가 `PATH`에 등록되어 있어야 합니다.
 - Entry에서 생성하거나 가져올 프로젝트 파일을 사용하려면 해당 프로젝트의 JSON 데이터가 필요합니다.
 
-Entscript CLI는 컴파일된 Entry 프로젝트 JSON을 `tar` 아카이브로 패키징합니다. `.ent` 파일은 이 프로젝트에서 사용하는 패키지 확장자이며, 내부에는 `temp/project.json`이 저장됩니다.
+Entscript CLI는 컴파일된 Entry 프로젝트 JSON과 프로젝트가 참조하는 이미지·썸네일·사운드 에셋을 gzip 압축된 TAR 아카이브로 패키징합니다. `.ent` 내부에는 `temp/project.json`과 `temp/` 기준의 에셋 경로가 저장됩니다.
 
 ### 첫 번째 프로그램
 
@@ -186,21 +187,29 @@ entscript --version
 
 ### 출력 패키지 구조
 
-컴파일 결과 `.ent`는 tar 아카이브입니다.
+컴파일 결과 `.ent`는 gzip으로 압축된 TAR 아카이브입니다.
 
 ```text
 hello.ent
 └── temp/
-    └── project.json
+    ├── project.json
+    ├── ab/
+    │   └── cd/
+    │       ├── image/<file-id>.png
+    │       ├── thumb/<file-id>.png
+    │       └── sound/<file-id>.mp3
+    └── ef/
+        └── gh/
+            └── sound/<file-id>.mp3
 ```
 
 아카이브 내부를 확인하려면 다음 명령을 사용합니다.
 
 ```bash
-tar -tf hello.ent
+tar -tzf hello.ent
 ```
 
-CLI는 시스템의 `tar` 프로그램을 실행합니다. 따라서 `tar`가 설치되어 있고 `PATH`에서 검색 가능해야 합니다.
+CLI는 시스템의 gzip 지원 `tar` 프로그램을 실행합니다. 따라서 gzip 압축을 지원하는 `tar`가 설치되어 있고 `PATH`에서 검색 가능해야 합니다.
 
 ---
 
@@ -217,11 +226,44 @@ project/
 ├── modules/
 │   └── player.ents
 ├── assets/
-│   └── thumbnail.png
+│   ├── ab/
+│   │   └── cd/
+│   │       ├── image/
+│   │       │   └── abcd1234.png
+│   │       └── thumb/
+│   │           └── abcd1234.png
+│   └── ef/
+│       └── gh/
+│           └── sound/
+│               └── efgh5678.mp3
 └── build/
 ```
 
 현재 CLI는 `build.entry`에 지정된 **단일 진입 파일**을 읽습니다. `modules/`는 프로젝트 파일을 정리하기 위한 예시 디렉터리이며, 현재 빌드 명령이 해당 폴더의 소스를 자동으로 찾아 합치지는 않습니다.
+
+### 에셋 디렉터리
+
+`assets/`는 Entry 프로젝트 JSON이 참조하는 실제 이미지·썸네일·사운드 파일을 보관하는 디렉터리입니다. Entry는 파일 ID의 앞 4글자를 2글자씩 나눠 폴더를 구성합니다.
+
+```text
+assets/
+└── ab/
+    └── cd/
+        ├── image/abcd1234.png
+        ├── thumb/abcd1234.png
+        └── sound/abcd1234.mp3
+```
+
+예를 들어 파일 ID가 `abcd1234`라면 저장 경로는 `assets/ab/cd/image/abcd1234.png`와 같은 형태입니다. `.ent` 안에서는 `temp/ab/cd/image/abcd1234.png`로 들어갑니다. 확장자와 실제 파일명은 프로젝트 JSON의 에셋 경로와 일치해야 합니다.
+
+빌드 시 다음 위치의 `assets/`를 자동으로 읽습니다.
+
+- `entscript build`: `--project-dir`로 지정한 프로젝트 디렉터리의 `assets/`
+- `entscript main.ents`: 명령을 실행한 현재 디렉터리의 `assets/`
+
+Entry가 프로젝트 JSON의 `fileurl` 또는 `thumbUrl`에서 이 해시 경로 형식을 참조하면, 빌더는 대응 파일이 실제로 존재하는지 검사합니다. 파일이 빠져 있으면 불완전한 `.ent`를 만들지 않고 오류를 반환합니다. **프로젝트 JSON이 실제로 참조하는 파일만** 패키지에 복사합니다. 참조되지 않는 에셋이나 `assets/thumbnail.png`처럼 Entry 에셋 경로 규칙에 맞지 않는 일반 파일은 복사하지 않습니다. 심볼릭 링크가 참조 경로에 포함되면 오류를 반환하며, 다른 위치의 심볼릭 링크는 에셋으로 따라가지 않습니다.
+
+`metadata.thumbnail`은 위 에셋 디렉터리의 파일을 자동 등록하는 기능이 아닙니다. 해당 설정은 별도의 메타데이터 문자열로 저장되며, 실제 오브젝트 이미지나 썸네일을 사용하려면 Entry 프로젝트 JSON의 에셋 참조와 파일 경로가 함께 있어야 합니다.
 
 ### 설정 파일 예시
 
@@ -486,7 +528,7 @@ var score = 0
 - `hide_variable(variable)`: 변수 표시를 끕니다.
 - 변수 이름은 식별자로 전달합니다.
 
-기존 Entry 프로젝트의 전역 변수도 이름으로 참조할 수 있습니다. 새 변수 이름이 기존 전역 변수와 충돌하면 오류가 발생합니다.
+기존 Entry 프로젝트의 전역 변수와 오브젝트 지역 변수도 이름으로 참조할 수 있습니다. `@오브젝트이름` 안에서는 해당 오브젝트의 지역 변수를 먼저 찾고, 없으면 전역 변수를 찾습니다. 함수 본문은 전역 변수 범위에서 분석됩니다. 새 `var` 선언은 기존 프로젝트의 같은 이름 변수와 충돌하면 오류가 발생합니다.
 
 ### 리스트
 
@@ -536,7 +578,7 @@ list empty_items = []
 
 리스트 인덱스는 Entry와 동일하게 **1부터 시작**합니다.
 
-기존 Entry 프로젝트에 있는 리스트도 이름으로 참조할 수 있습니다. 변수와 리스트의 지역 범위 선언은 아직 지원하지 않습니다.
+기존 Entry 프로젝트에 있는 리스트도 이름으로 참조할 수 있습니다. `@오브젝트이름` 안에서는 해당 오브젝트의 지역 리스트를 먼저 찾고, 없으면 전역 리스트를 찾습니다. 리스트 이름은 식별자나 문자열로 지정할 수 있습니다. 다만 Entscript의 `var`와 `list` 선언은 현재 전역 범위만 지원합니다.
 
 ---
 
@@ -595,7 +637,7 @@ fn announce(message: string, condition: bool) {
 }
 ```
 
-함수 호출 시 인자 개수를 검사합니다. 컴파일러가 인자 타입을 판별할 수 있는 경우 값/불리언 타입 불일치도 오류로 처리합니다.
+함수 호출 시 인자 개수를 검사합니다. 컴파일러가 인자 타입을 판별할 수 있는 경우 값/불리언 타입 불일치도 오류로 처리합니다. 기존 Entry 프로젝트의 사용자 함수도 `func_<함수ID>(...)` 형태로 직접 호출할 수 있습니다. 이 경우 저장된 함수 블록의 매개변수 리본을 읽어 인자 개수와 확인 가능한 값/불리언 타입을 검사합니다.
 
 ### 함수 호출 규칙
 
@@ -797,7 +839,7 @@ entscript main.ents --project existing-project.json -o updated.ent
 
 Entscript의 `@오브젝트이름`은 전달한 프로젝트의 실제 오브젝트 이름과 일치해야 합니다. 이름이 없거나 중복되면 컴파일 오류가 발생합니다.
 
-기존 프로젝트 JSON의 스크립트는 Entscript에서 선언한 해당 오브젝트의 스크립트로 교체됩니다. 프로젝트의 나머지 데이터는 컴파일러가 수정하는 대상이 아닌 한 유지됩니다.
+기존 프로젝트 JSON의 스크립트는 Entscript에서 선언한 해당 오브젝트의 스크립트로 교체됩니다. 프로젝트 변수·리스트·함수 메타데이터를 검사하고, 오브젝트 지역 변수와 전역 변수의 범위를 구분해 참조합니다. 프로젝트의 나머지 데이터는 컴파일러가 수정하는 대상이 아닌 한 유지됩니다.
 
 ---
 
@@ -924,7 +966,7 @@ Unknown block 'some_name'
 - 참조/포인터 매개변수
 - 전역 변수 및 리스트 외의 지역 범위 선언
 - 프로젝트 디렉터리 내 여러 `.ents` 파일의 자동 탐색·병합
-- 썸네일 파일의 패키지 내 임베딩 및 서버 업로드
+- `metadata.thumbnail`에 지정한 별도 메타데이터 썸네일의 자동 등록 및 서버 업로드
 - AI·확장·하드웨어 런타임 구성
 - 모든 Entry 네이티브 블록에 대한 친숙한 별칭
 
@@ -938,6 +980,9 @@ Unknown block 'some_name'
 - [Entry 블록 탭 및 카테고리](https://docs.playentry.org/user/tab_block.html)
 - [EntryJS Project Data](https://docs.playentry.org/entryjs/typedef/2024-03-15-project-data.html)
 - [EntryJS Variable Data](https://docs.playentry.org/entryjs/typedef/2024-03-15-variable-data.html)
+- [EntryJS Function Data](https://docs.playentry.org/entryjs/typedef/2024-03-15-function-data.html)
+- [EntryJS Object Data](https://docs.playentry.org/entryjs/typedef/2024-03-15-object-data.html)
+- [EntryJS ENT 파일 관리](https://docs.playentry.org/entryjs/file/2024-07-24-ent.html)
 
 ## 라이선스
 

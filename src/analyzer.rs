@@ -12,6 +12,7 @@ pub struct Analyzer;
 
 impl Analyzer {
     pub fn analyze(program: &Program, project: &Value) -> Result<(), CompileError> {
+        Self::validate_project_collections(project)?;
         Self::validate_declarations(program, project)?;
 
         let objects = project
@@ -48,9 +49,13 @@ impl Analyzer {
                     Self::ensure_builtin_type(&handler.event)?;
                 }
                 for argument in &handler.args {
-                    Self::analyze_expression(argument, project, program, &empty_parameters)?;
+                    Self::analyze_expression(
+                        argument, project, program, &empty_parameters, Some(&section.name),
+                    )?;
                 }
-                Self::analyze_statements(&handler.body, project, program, &empty_parameters)?;
+                Self::analyze_statements(
+                    &handler.body, project, program, &empty_parameters, Some(&section.name),
+                )?;
             }
         }
 
@@ -59,14 +64,14 @@ impl Analyzer {
                 .map(|param| (param.name.clone(), param.kind))
                 .collect::<HashMap<_, _>>();
             if let Some(value) = &function.return_value {
-                Self::analyze_expression(value, project, program, &param_kinds)?;
+                Self::analyze_expression(value, project, program, &param_kinds, None)?;
                 if !Self::is_value_expression(value, program) {
                     return Err(CompileError::Semantic(format!(
                         "Return value of function '{}' must be a reporter expression", function.name
                     )));
                 }
             }
-            Self::analyze_statements(&function.body, project, program, &param_kinds)?;
+            Self::analyze_statements(&function.body, project, program, &param_kinds, None)?;
 
             // Prevent parameter names from shadowing each other or creating
             // ambiguous variable references in the generated Entry script.
@@ -93,7 +98,6 @@ impl Analyzer {
             let collision = project.get("variables").and_then(Value::as_array).is_some_and(|items| {
                 items.iter().any(|variable| {
                     variable.get("name").and_then(Value::as_str) == Some(declaration.name.as_str())
-                        && variable.get("object").map_or(true, Value::is_null)
                 })
             });
             if collision {
@@ -121,8 +125,14 @@ impl Analyzer {
             }
         }
 
+        let existing_function_names = Self::project_function_names(project);
         let mut function_names = HashSet::new();
         for function in &program.functions {
+            if existing_function_names.contains(&function.name) {
+                return Err(CompileError::Semantic(format!(
+                    "Function '{}' already exists in the Entry project", function.name
+                )));
+            }
             if !function_names.insert(function.name.as_str()) {
                 return Err(CompileError::Semantic(format!(
                     "Function '{}' is declared more than once", function.name
@@ -155,6 +165,7 @@ impl Analyzer {
         project: &Value,
         program: &Program,
         parameters: &HashMap<String, FunctionParameterKind>,
+        scope_object: Option<&str>,
     ) -> Result<(), CompileError> {
         for statement in statements {
             let Statement::BlockCall { name, args, body, else_body } = statement;
@@ -170,7 +181,9 @@ impl Analyzer {
                         "Function call '{}' cannot have a statement body", name
                     )));
                 }
-                Self::check_function_arguments(function, args, project, program, parameters)?;
+                Self::check_function_arguments(
+                    function, args, project, program, parameters, scope_object,
+                )?;
                 continue;
             }
 
@@ -184,8 +197,11 @@ impl Analyzer {
                     if body.is_some() || else_body.is_some() {
                         return Err(CompileError::Semantic("Function calls cannot have statement bodies".into()));
                     }
+                    Self::check_project_function_arguments(
+                        function_id, args, project, program, parameters,
+                    )?;
                     for argument in args {
-                        Self::analyze_expression(argument, project, program, parameters)?;
+                        Self::analyze_expression(argument, project, program, parameters, scope_object)?;
                     }
                     continue;
                 }
@@ -199,23 +215,23 @@ impl Analyzer {
                         "set/change expects a variable name followed by a value".into(),
                     )),
                 };
-                Self::ensure_scalar_variable_exists(variable_name, project, program)?;
-                Self::analyze_expression(value_expression, project, program, parameters)?;
+                Self::ensure_scalar_variable_exists(variable_name, project, program, scope_object)?;
+                Self::analyze_expression(value_expression, project, program, parameters, scope_object)?;
                 Self::ensure_no_statement_areas(name, body, else_body)?;
                 continue;
             }
 
             if matches!(name.as_str(), "show_variable" | "hide_variable") {
                 let variable_name = Self::one_identifier_argument(name, args)?;
-                Self::ensure_scalar_variable_exists(variable_name, project, program)?;
+                Self::ensure_scalar_variable_exists(variable_name, project, program, scope_object)?;
                 Self::ensure_no_statement_areas(name, body, else_body)?;
                 continue;
             }
 
             if let Some((list_name, expressions)) = Self::list_statement_arguments(name, args)? {
-                Self::ensure_list_exists(list_name, project, program)?;
+                Self::ensure_list_exists(list_name, project, program, scope_object)?;
                 for expression in expressions {
-                    Self::analyze_expression(expression, project, program, parameters)?;
+                    Self::analyze_expression(expression, project, program, parameters, scope_object)?;
                 }
                 Self::ensure_no_statement_areas(name, body, else_body)?;
                 continue;
@@ -229,10 +245,10 @@ impl Analyzer {
                 };
                 Self::ensure_builtin_type(type_id)?;
                 for argument in &args[1..] {
-                    Self::analyze_expression(argument, project, program, parameters)?;
+                    Self::analyze_expression(argument, project, program, parameters, scope_object)?;
                 }
-                if let Some(body) = body { Self::analyze_statements(body, project, program, parameters)?; }
-                if let Some(body) = else_body { Self::analyze_statements(body, project, program, parameters)?; }
+                if let Some(body) = body { Self::analyze_statements(body, project, program, parameters, scope_object)?; }
+                if let Some(body) = else_body { Self::analyze_statements(body, project, program, parameters, scope_object)?; }
                 continue;
             }
 
@@ -268,10 +284,10 @@ impl Analyzer {
             }
             Self::ensure_builtin_type(name)?;
             for argument in args {
-                Self::analyze_expression(argument, project, program, parameters)?;
+                Self::analyze_expression(argument, project, program, parameters, scope_object)?;
             }
-            if let Some(body) = body { Self::analyze_statements(body, project, program, parameters)?; }
-            if let Some(body) = else_body { Self::analyze_statements(body, project, program, parameters)?; }
+            if let Some(body) = body { Self::analyze_statements(body, project, program, parameters, scope_object)?; }
+            if let Some(body) = else_body { Self::analyze_statements(body, project, program, parameters, scope_object)?; }
         }
         Ok(())
     }
@@ -281,12 +297,13 @@ impl Analyzer {
         project: &Value,
         program: &Program,
         parameters: &HashMap<String, FunctionParameterKind>,
+        scope_object: Option<&str>,
     ) -> Result<(), CompileError> {
         match expression {
             Expression::String(_) | Expression::Number(_) | Expression::Boolean(_) | Expression::Null => Ok(()),
             Expression::Identifier(name) => {
                 if parameters.contains_key(name) { Ok(()) }
-                else { Self::ensure_scalar_variable_exists(name, project, program) }
+                else { Self::ensure_scalar_variable_exists(name, project, program, scope_object) }
             }
             Expression::Call { name, args } if name == "field" => match args.as_slice() {
                 [Expression::String(_)] | [Expression::Identifier(_)] => Ok(()),
@@ -299,14 +316,19 @@ impl Analyzer {
             },
             Expression::Call { name, args } if matches!(name.as_str(), "list_get" | "list_length" | "list_contains") => {
                 match (name.as_str(), args.as_slice()) {
-                    ("list_get", [Expression::Identifier(list_name), index]) => {
-                        Self::ensure_list_exists(list_name, project, program)?;
-                        Self::analyze_expression(index, project, program, parameters)
+                    ("list_get", [Expression::Identifier(list_name), index])
+                    | ("list_get", [Expression::String(list_name), index]) => {
+                        Self::ensure_list_exists(list_name, project, program, scope_object)?;
+                        Self::analyze_expression(index, project, program, parameters, scope_object)
                     }
-                    ("list_length", [Expression::Identifier(list_name)]) => Self::ensure_list_exists(list_name, project, program),
-                    ("list_contains", [Expression::Identifier(list_name), value]) => {
-                        Self::ensure_list_exists(list_name, project, program)?;
-                        Self::analyze_expression(value, project, program, parameters)
+                    ("list_length", [Expression::Identifier(list_name)])
+                    | ("list_length", [Expression::String(list_name)]) => {
+                        Self::ensure_list_exists(list_name, project, program, scope_object)
+                    }
+                    ("list_contains", [Expression::Identifier(list_name), value])
+                    | ("list_contains", [Expression::String(list_name), value]) => {
+                        Self::ensure_list_exists(list_name, project, program, scope_object)?;
+                        Self::analyze_expression(value, project, program, parameters, scope_object)
                     }
                     _ => Err(CompileError::Semantic(format!("Invalid arguments for '{}'", name))),
                 }
@@ -316,14 +338,17 @@ impl Analyzer {
                     return Err(CompileError::Semantic("raw_block requires a block type string".into()));
                 };
                 Self::ensure_builtin_type(type_id)?;
-                for arg in &args[1..] { Self::analyze_expression(arg, project, program, parameters)?; }
+                for arg in &args[1..] { Self::analyze_expression(arg, project, program, parameters, scope_object)?; }
                 Ok(())
             }
             Expression::Call { name, args } => {
                 if let Some(function_id) = name.strip_prefix("func_") {
                     if Self::project_function_is_value(project, function_id) {
+                        Self::check_project_function_arguments(
+                            function_id, args, project, program, parameters,
+                        )?;
                         for argument in args {
-                            Self::analyze_expression(argument, project, program, parameters)?;
+                            Self::analyze_expression(argument, project, program, parameters, scope_object)?;
                         }
                         return Ok(());
                     }
@@ -334,7 +359,7 @@ impl Analyzer {
                             "Void function '{}' cannot be used as a value", name
                         )));
                     }
-                    Self::check_function_arguments(function, args, project, program, parameters)?;
+                    Self::check_function_arguments(function, args, project, program, parameters, scope_object)?;
                     return Ok(());
                 }
                 if statement_spec(name).is_some() {
@@ -348,14 +373,411 @@ impl Analyzer {
                     Self::ensure_builtin_type(name)?;
                     return Err(CompileError::Semantic(format!("Unknown block '{}'", name)));
                 }
-                for arg in args { Self::analyze_expression(arg, project, program, parameters)?; }
+                for arg in args { Self::analyze_expression(arg, project, program, parameters, scope_object)?; }
                 Ok(())
             }
-            Expression::Unary { value, .. } => Self::analyze_expression(value, project, program, parameters),
+            Expression::Unary { value, .. } => Self::analyze_expression(value, project, program, parameters, scope_object),
             Expression::Binary { left, right, .. } => {
-                Self::analyze_expression(left, project, program, parameters)?;
-                Self::analyze_expression(right, project, program, parameters)
+                Self::analyze_expression(left, project, program, parameters, scope_object)?;
+                Self::analyze_expression(right, project, program, parameters, scope_object)
             }
+        }
+    }
+
+    fn validate_project_collections(project: &Value) -> Result<(), CompileError> {
+        let objects = project.get("objects").and_then(Value::as_array).ok_or_else(|| {
+            CompileError::Project("Project must contain an 'objects' array".into())
+        })?;
+        let mut object_ids = HashSet::new();
+        for object in objects {
+            let Some(id) = object.get("id").and_then(Value::as_str) else {
+                return Err(CompileError::Project(
+                    "Every project object must have a string 'id'".into(),
+                ));
+            };
+            if id.is_empty() || !object_ids.insert(id) {
+                return Err(CompileError::Project(format!(
+                    "Project contains an empty or duplicate object id '{id}'"
+                )));
+            }
+            if object.get("name").and_then(Value::as_str).is_none() {
+                return Err(CompileError::Project(format!(
+                    "Project object '{id}' must have a string 'name'"
+                )));
+            }
+        }
+
+        if let Some(variables) = project.get("variables") {
+            let variables = variables.as_array().ok_or_else(|| {
+                CompileError::Project("Project 'variables' must be an array".into())
+            })?;
+            let mut variable_ids = HashSet::new();
+            let mut scoped_names = HashSet::new();
+
+            for variable in variables {
+                let Some(id) = variable.get("id").and_then(Value::as_str) else {
+                    return Err(CompileError::Project(
+                        "Every project variable must have a string 'id'".into(),
+                    ));
+                };
+                let Some(name) = variable.get("name").and_then(Value::as_str) else {
+                    return Err(CompileError::Project(
+                        format!("Project variable '{id}' must have a string 'name'"),
+                    ));
+                };
+                if name.trim().is_empty() {
+                    return Err(CompileError::Project(format!(
+                        "Project variable '{id}' has an empty name"
+                    )));
+                }
+                if id.is_empty() || !variable_ids.insert(id) {
+                    return Err(CompileError::Project(format!(
+                        "Project contains an empty or duplicate variable id '{id}'"
+                    )));
+                }
+                if !matches!(
+                    variable.get("variableType").and_then(Value::as_str),
+                    Some("variable" | "list" | "timer" | "answer" | "slide")
+                ) {
+                    return Err(CompileError::Project(format!(
+                        "Project variable '{name}' has an unsupported or missing variableType"
+                    )));
+                }
+                let owner = match variable.get("object") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(owner)) if object_ids.contains(owner.as_str()) => Some(owner.as_str()),
+                    Some(Value::String(owner)) => {
+                        return Err(CompileError::Project(format!(
+                            "Project variable '{name}' refers to unknown object id '{owner}'"
+                        )));
+                    }
+                    Some(_) => {
+                        return Err(CompileError::Project(format!(
+                            "Project variable '{name}' has an invalid 'object' owner"
+                        )));
+                    }
+                };
+
+                for (field, expected) in [
+                    ("value", "string"),
+                    ("visible", "boolean"),
+                    ("isCloud", "boolean"),
+                ] {
+                    if let Some(value) = variable.get(field) {
+                        let valid = match expected {
+                            "string" => value.is_string(),
+                            "boolean" => value.is_boolean(),
+                            _ => false,
+                        };
+                        if !valid {
+                            return Err(CompileError::Project(format!(
+                                "Project variable '{name}' has an invalid '{field}' field"
+                            )));
+                        }
+                    }
+                }
+                for field in ["x", "y", "width", "height", "minValue", "maxValue"] {
+                    if variable.get(field).is_some_and(|value| !value.is_null() && !value.is_number()) {
+                        return Err(CompileError::Project(format!(
+                            "Project variable '{name}' has an invalid '{field}' field"
+                        )));
+                    }
+                }
+                if variable.get("variableType").and_then(Value::as_str) == Some("list") {
+                    let items = variable.get("array").and_then(Value::as_array).ok_or_else(|| {
+                        CompileError::Project(format!(
+                            "Project list '{name}' must contain an 'array'"
+                        ))
+                    })?;
+                    for (index, item) in items.iter().enumerate() {
+                        if item.get("data").and_then(Value::as_str).is_none() {
+                            return Err(CompileError::Project(format!(
+                                "Project list '{name}' item {} must contain a string 'data' field",
+                                index + 1
+                            )));
+                        }
+                    }
+                }
+                if !scoped_names.insert((owner, name)) {
+                    return Err(CompileError::Project(format!(
+                        "Project contains duplicate variable name '{name}' in the same scope"
+                    )));
+                }
+            }
+        }
+        if let Some(functions) = project.get("functions") {
+            let functions = functions.as_array().ok_or_else(|| {
+                CompileError::Project("Project 'functions' must be an array".into())
+            })?;
+            let mut ids = HashSet::new();
+            let mut names = HashSet::new();
+            for function in functions {
+                let Some(id) = function.get("id").and_then(Value::as_str) else {
+                    return Err(CompileError::Project(
+                        "Every project function must have a string 'id'".into(),
+                    ));
+                };
+                if id.is_empty() || !ids.insert(id) {
+                    return Err(CompileError::Project(format!(
+                        "Project contains an empty or duplicate function id '{id}'"
+                    )));
+                }
+                if !matches!(function.get("type").and_then(Value::as_str), Some("normal" | "value")) {
+                    return Err(CompileError::Project(format!(
+                        "Project function '{id}' must have type 'normal' or 'value'"
+                    )));
+                }
+
+                if function.get("useLocalVariables")
+                    .is_some_and(|value| !value.is_null() && !value.is_boolean())
+                {
+                    return Err(CompileError::Project(format!(
+                        "Project function '{id}' has an invalid 'useLocalVariables' field"
+                    )));
+                }
+                if function.get("localVariables")
+                    .is_some_and(|value| !value.is_null() && !value.is_array())
+                {
+                    return Err(CompileError::Project(format!(
+                        "Project function '{id}' has an invalid 'localVariables' field"
+                    )));
+                }
+
+                let Some(content) = function.get("content").and_then(Value::as_str) else {
+                    return Err(CompileError::Project(format!(
+                        "Project function '{id}' must have a string 'content' field"
+                    )));
+                };
+                let content: Value = serde_json::from_str(content).map_err(|error| {
+                    CompileError::Project(format!(
+                        "Project function '{id}' has invalid JSON in 'content': {error}"
+                    ))
+                })?;
+                let definition = Self::find_function_create_block(&content).ok_or_else(|| {
+                    CompileError::Project(format!(
+                        "Project function '{id}' does not contain a function definition block"
+                    ))
+                })?;
+                let expected_type = if function.get("type").and_then(Value::as_str) == Some("value") {
+                    "function_create_value"
+                } else {
+                    "function_create"
+                };
+                if definition.get("type").and_then(Value::as_str) != Some(expected_type) {
+                    return Err(CompileError::Project(format!(
+                        "Project function '{id}' has a definition block that does not match its type"
+                    )));
+                }
+                let name = Self::find_function_label(&content).ok_or_else(|| {
+                    CompileError::Project(format!(
+                        "Project function '{id}' is missing its function name"
+                    ))
+                })?;
+                if name.trim().is_empty() || !names.insert(name.clone()) {
+                    return Err(CompileError::Project(format!(
+                        "Project contains an empty or duplicate function name '{name}'"
+                    )));
+                }
+                if Self::project_function_parameter_kinds(project, id).is_none() {
+                    return Err(CompileError::Project(format!(
+                        "Project function '{id}' has an invalid parameter definition"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a variable/list using Entry's object-local-first lookup rule,
+    /// then fall back to the global namespace. Ambiguous matches are rejected.
+    fn find_project_variable<'a>(
+        name: &str,
+        project: &'a Value,
+        scope_object: Option<&str>,
+    ) -> Result<Option<&'a Value>, CompileError> {
+        let Some(variables_value) = project.get("variables") else {
+            return Ok(None);
+        };
+        let variables = variables_value.as_array().ok_or_else(|| {
+            CompileError::Project("Project 'variables' must be an array".into())
+        })?;
+
+        let object_id = scope_object.and_then(|object_name| {
+            project.get("objects")
+                .and_then(Value::as_array)
+                .and_then(|objects| objects.iter().find(|object| {
+                    object.get("name").and_then(Value::as_str) == Some(object_name)
+                }))
+                .and_then(|object| object.get("id"))
+                .and_then(Value::as_str)
+        });
+
+        let mut local_matches = Vec::new();
+        let mut global_matches = Vec::new();
+        for variable in variables {
+            if variable.get("name").and_then(Value::as_str) != Some(name) {
+                continue;
+            }
+            if let (Some(owner_id), Some(variable_owner)) = (
+                object_id,
+                variable.get("object").and_then(Value::as_str),
+            ) {
+                if variable_owner == owner_id {
+                    local_matches.push(variable);
+                    continue;
+                }
+            }
+            if variable.get("object").map_or(true, Value::is_null) {
+                global_matches.push(variable);
+            }
+        }
+
+        let matches = if local_matches.is_empty() { &global_matches } else { &local_matches };
+        match matches.as_slice() {
+            [] => Ok(None),
+            [variable] => {
+                let id = variable.get("id").and_then(Value::as_str).filter(|id| !id.is_empty());
+                if id.is_none() {
+                    return Err(CompileError::Project(format!(
+                        "Project variable '{name}' is missing a valid string id"
+                    )));
+                }
+                Ok(Some(*variable))
+            }
+            _ => Err(CompileError::Project(format!(
+                "Variable name '{name}' is ambiguous in the selected scope"
+            ))),
+        }
+    }
+
+    fn project_function_names(project: &Value) -> HashSet<String> {
+        let mut names = HashSet::new();
+        let Some(functions) = project.get("functions").and_then(Value::as_array) else {
+            return names;
+        };
+        for function in functions {
+            let Some(content) = function.get("content").and_then(Value::as_str) else {
+                continue;
+            };
+            let Ok(content) = serde_json::from_str::<Value>(content) else {
+                continue;
+            };
+            if let Some(name) = Self::find_function_label(&content) {
+                names.insert(name);
+            }
+        }
+        names
+    }
+
+    fn find_function_label(value: &Value) -> Option<String> {
+        match value {
+            Value::Array(items) => items.iter().find_map(Self::find_function_label),
+            Value::Object(map) => {
+                if map.get("type").and_then(Value::as_str) == Some("function_field_label") {
+                    return map.get("params")
+                        .and_then(Value::as_array)
+                        .and_then(|params| params.first())
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                map.values().find_map(Self::find_function_label)
+            }
+            _ => None,
+        }
+    }
+
+    fn check_project_function_arguments(
+        function_id: &str,
+        args: &[Expression],
+        project: &Value,
+        program: &Program,
+        caller_parameters: &HashMap<String, FunctionParameterKind>,
+    ) -> Result<(), CompileError> {
+        if let Some(parameter_kinds) = Self::project_function_parameter_kinds(project, function_id) {
+            let expected = parameter_kinds.len();
+            if args.len() != expected {
+                return Err(CompileError::Semantic(format!(
+                    "Entry function 'func_{function_id}' expects {expected} argument(s), but {} were provided",
+                    args.len()
+                )));
+            }
+            for (index, (kind, argument)) in parameter_kinds.iter().zip(args).enumerate() {
+                let Some(kind) = kind else { continue };
+                let argument_is_boolean = Self::expression_is_boolean(
+                    argument, program, caller_parameters, &mut HashSet::new(),
+                );
+                let mismatch = matches!(
+                    (*kind, argument_is_boolean),
+                    (FunctionParameterKind::Boolean, Some(false))
+                        | (FunctionParameterKind::Value, Some(true))
+                );
+                if mismatch {
+                    let expected = match kind {
+                        FunctionParameterKind::Boolean => "a boolean",
+                        FunctionParameterKind::Value => "a value",
+                    };
+                    return Err(CompileError::Semantic(format!(
+                        "Argument {} of Entry function 'func_{function_id}' must be {expected}",
+                        index + 1
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn project_function_parameter_kinds(
+        project: &Value,
+        function_id: &str,
+    ) -> Option<Vec<Option<FunctionParameterKind>>> {
+        let function = project.get("functions")?.as_array()?.iter().find(|function| {
+            function.get("id").and_then(Value::as_str) == Some(function_id)
+        })?;
+        let content = serde_json::from_str::<Value>(function.get("content")?.as_str()?).ok()?;
+        let definition = Self::find_function_create_block(&content)?;
+        let header = definition.get("params")?.as_array()?.first()?;
+        if header.get("type")?.as_str()? != "function_field_label" {
+            return None;
+        }
+        let header_params = header.get("params")?.as_array()?;
+        let Some(mut ribbon) = header_params.get(1) else {
+            // Some older Entry projects omit the empty parameter-chain slot
+            // entirely for functions that have no parameters.
+            return Some(Vec::new());
+        };
+        if ribbon.is_null() {
+            return Some(Vec::new());
+        }
+
+        let mut kinds = Vec::new();
+        loop {
+            let kind = ribbon.get("type")?.as_str()?;
+            if !kind.starts_with("function_field_") {
+                return None;
+            }
+            kinds.push(match kind {
+                "function_field_string" => Some(FunctionParameterKind::Value),
+                "function_field_boolean" => Some(FunctionParameterKind::Boolean),
+                _ => None,
+            });
+            let params = ribbon.get("params")?.as_array()?;
+            ribbon = params.get(1)?;
+            if ribbon.is_null() {
+                return Some(kinds);
+            }
+        }
+    }
+
+    fn find_function_create_block(value: &Value) -> Option<&Value> {
+        match value {
+            Value::Array(items) => items.iter().find_map(Self::find_function_create_block),
+            Value::Object(map) => {
+                if matches!(map.get("type").and_then(Value::as_str), Some("function_create" | "function_create_value")) {
+                    return Some(value);
+                }
+                map.values().find_map(Self::find_function_create_block)
+            }
+            _ => None,
         }
     }
 
@@ -363,6 +785,7 @@ impl Analyzer {
         name: &str,
         project: &Value,
         program: &Program,
+        scope_object: Option<&str>,
     ) -> Result<(), CompileError> {
         if let Some(declaration) = program.variables.iter().find(|variable| variable.name == name) {
             return match declaration.kind {
@@ -373,12 +796,7 @@ impl Analyzer {
             };
         }
 
-        let variable = project.get("variables").and_then(Value::as_array).and_then(|variables| {
-            variables.iter().find(|variable| {
-                variable.get("name").and_then(Value::as_str) == Some(name)
-                    && variable.get("id").and_then(Value::as_str).is_some()
-            })
-        });
+        let variable = Self::find_project_variable(name, project, scope_object)?;
         match variable {
             Some(variable) if variable.get("variableType").and_then(Value::as_str) == Some("list") => {
                 Err(CompileError::Semantic(format!("'{name}' is a list, not a scalar variable")))
@@ -388,7 +806,12 @@ impl Analyzer {
         }
     }
 
-    fn ensure_list_exists(name: &str, project: &Value, program: &Program) -> Result<(), CompileError> {
+    fn ensure_list_exists(
+        name: &str,
+        project: &Value,
+        program: &Program,
+        scope_object: Option<&str>,
+    ) -> Result<(), CompileError> {
         if let Some(declaration) = program.variables.iter().find(|variable| variable.name == name) {
             return match declaration.kind {
                 VariableKind::List => Ok(()),
@@ -398,12 +821,7 @@ impl Analyzer {
             };
         }
 
-        let variable = project.get("variables").and_then(Value::as_array).and_then(|variables| {
-            variables.iter().find(|variable| {
-                variable.get("name").and_then(Value::as_str) == Some(name)
-                    && variable.get("id").and_then(Value::as_str).is_some()
-            })
-        });
+        let variable = Self::find_project_variable(name, project, scope_object)?;
         match variable {
             Some(variable) if variable.get("variableType").and_then(Value::as_str) == Some("list") => Ok(()),
             Some(_) => Err(CompileError::Semantic(format!("'{name}' is a scalar variable, not a list"))),
@@ -420,11 +838,16 @@ impl Analyzer {
 
     fn list_statement_arguments<'a>(name: &str, args: &'a [Expression]) -> Result<Option<(&'a str, Vec<&'a Expression>)>, CompileError> {
         let (list_name, expressions) = match (name, args) {
-            ("list_add", [Expression::Identifier(list), value]) => (list.as_str(), vec![value]),
-            ("list_remove", [Expression::Identifier(list), index]) => (list.as_str(), vec![index]),
-            ("list_insert", [Expression::Identifier(list), index, value]) => (list.as_str(), vec![index, value]),
-            ("list_set", [Expression::Identifier(list), index, value]) => (list.as_str(), vec![index, value]),
-            ("list_show" | "list_hide", [Expression::Identifier(list)]) => (list.as_str(), vec![]),
+            ("list_add", [Expression::Identifier(list), value])
+            | ("list_add", [Expression::String(list), value]) => (list.as_str(), vec![value]),
+            ("list_remove", [Expression::Identifier(list), index])
+            | ("list_remove", [Expression::String(list), index]) => (list.as_str(), vec![index]),
+            ("list_insert", [Expression::Identifier(list), index, value])
+            | ("list_insert", [Expression::String(list), index, value]) => (list.as_str(), vec![index, value]),
+            ("list_set", [Expression::Identifier(list), index, value])
+            | ("list_set", [Expression::String(list), index, value]) => (list.as_str(), vec![index, value]),
+            ("list_show" | "list_hide", [Expression::Identifier(list)])
+            | ("list_show" | "list_hide", [Expression::String(list)]) => (list.as_str(), vec![]),
             _ if name.starts_with("list_") => return Err(CompileError::Semantic(format!("Invalid arguments for list operation '{name}'"))),
             _ => return Ok(None),
         };
@@ -447,6 +870,7 @@ impl Analyzer {
         project: &Value,
         program: &Program,
         caller_parameters: &HashMap<String, FunctionParameterKind>,
+        scope_object: Option<&str>,
     ) -> Result<(), CompileError> {
         if args.len() != function.params.len() {
             return Err(CompileError::Semantic(format!(
@@ -456,7 +880,7 @@ impl Analyzer {
         }
 
         for (index, (parameter, argument)) in function.params.iter().zip(args).enumerate() {
-            Self::analyze_expression(argument, project, program, caller_parameters)?;
+            Self::analyze_expression(argument, project, program, caller_parameters, scope_object)?;
             let argument_is_boolean = Self::expression_is_boolean(
                 argument, program, caller_parameters, &mut HashSet::new(),
             );
